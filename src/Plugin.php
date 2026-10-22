@@ -286,7 +286,7 @@ class Plugin
             wp_send_json_error(['message' => __('Không đủ quyền hạn.', 'spl-cloud-backup')]);
         }
 
-        $filename = sanitize_file_name($_POST['filename'] ?? '');
+        $filename = basename(sanitize_text_field(wp_unslash((string) ($_POST['filename'] ?? ''))));
         if (empty($filename)) {
             wp_send_json_error(['message' => __('Tên tệp không hợp lệ.', 'spl-cloud-backup')]);
         }
@@ -308,35 +308,34 @@ class Plugin
             wp_die(__('Không có quyền tải tệp tin.', 'spl-cloud-backup'));
         }
 
-        $isSplNonce = isset($_REQUEST['_wpnonce']) && wp_verify_nonce($_REQUEST['_wpnonce'], 'spl_backup_download');
-        $isHdNonce = isset($_REQUEST['_wpnonce']) && wp_verify_nonce($_REQUEST['_wpnonce'], 'hd_backup_download');
+        $nonce = isset($_REQUEST['_wpnonce']) ? sanitize_text_field(wp_unslash((string) $_REQUEST['_wpnonce'])) : '';
+        $isSplNonce = $nonce !== '' && wp_verify_nonce($nonce, 'spl_backup_download');
+        $isHdNonce = $nonce !== '' && wp_verify_nonce($nonce, 'hd_backup_download');
 
         if (!$isSplNonce && !$isHdNonce) {
             wp_die(__('Liên kết tải về đã hết hạn hoặc không hợp lệ.', 'spl-cloud-backup'));
         }
 
-        $filename = sanitize_file_name($_GET['file'] ?? '');
+        $filename = basename(sanitize_text_field(wp_unslash((string) ($_GET['file'] ?? ''))));
         $path = LocalVault::getFilePath($filename);
 
         if (!$path || !file_exists($path)) {
             wp_die(__('Tệp tin không tồn tại trong kho lưu trữ.', 'spl-cloud-backup'));
         }
 
-        $size = filesize($path);
+        $size = (int) filesize($path);
         $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
         $mime = ($ext === 'gz') ? 'application/gzip' : 'application/zip';
 
-        if (ob_get_level()) {
-            ob_end_clean();
+        while (ob_get_level() > 0) {
+            @ob_end_clean();
         }
 
+        nocache_headers();
         header('Content-Description: File Transfer');
         header('Content-Type: ' . $mime);
-        header('Content-Disposition: attachment; filename="' . basename($filename) . '"');
+        header('Content-Disposition: attachment; filename="' . basename($path) . '"');
         header('Content-Transfer-Encoding: binary');
-        header('Expires: 0');
-        header('Cache-Control: must-revalidate');
-        header('Pragma: public');
         header('Content-Length: ' . $size);
 
         readfile($path);

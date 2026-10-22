@@ -94,7 +94,16 @@ class LocalVault
      */
     public static function getFilePath(string $filename): ?string
     {
-        $cleanName = basename($filename);
+        $cleanName = basename(trim($filename));
+        if ($cleanName === '' || $cleanName === '.' || $cleanName === '..') {
+            return null;
+        }
+
+        // Only allow safe backup filename characters and valid extensions (.sql.gz, .zip, .sql)
+        if (!preg_match('/^[a-zA-Z0-9._-]+\.(sql\.gz|zip|sql)$/i', $cleanName)) {
+            return null;
+        }
+
         $fullPath = self::getVaultPath() . $cleanName;
 
         if (file_exists($fullPath) && is_file($fullPath)) {
