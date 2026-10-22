@@ -42,16 +42,20 @@ class BackupCommand
     {
         WP_CLI::line('🚀 Bắt đầu chạy sao lưu SPL Cloud Backup qua WP-CLI...');
 
-        // Override settings if flags provided
-        if (isset($assocArgs['type'])) {
-            $settings = get_option('spl_cloud_backup_settings', []);
-            $settings['backup_type'] = $assocArgs['type'];
-            update_option('spl_cloud_backup_settings', $settings, false);
+        $overrides = [];
+        if (isset($assocArgs['type']) && in_array($assocArgs['type'], ['db_only', 'db_and_files', 'full'], true)) {
+            $overrides['backup_type'] = $assocArgs['type'];
+        }
+        if (isset($assocArgs['no-upload']) || (isset($assocArgs['upload']) && $assocArgs['upload'] === false)) {
+            $overrides['enable_google_drive'] = 0;
+        }
+        if (isset($assocArgs['no-email']) || (isset($assocArgs['email']) && $assocArgs['email'] === false)) {
+            $overrides['enable_email_report'] = 0;
         }
 
         $result = CronRunner::runFullBackup('WP-CLI Terminal', function ($msg, $pct) {
             WP_CLI::line(sprintf('[%3d%%] %s', (int)$pct, $msg));
-        });
+        }, $overrides);
 
         if ($result['success']) {
             WP_CLI::success(sprintf('Sao lưu thành công! Thời gian: %ss', $result['duration']));

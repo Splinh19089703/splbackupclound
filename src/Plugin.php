@@ -62,6 +62,10 @@ class Plugin
         add_action('admin_init', [$this, 'registerSettings']);
         add_action('admin_enqueue_scripts', [$this, 'enqueueAdminAssets']);
 
+        // Re-sync Cron when schedule settings are added or updated
+        add_action('add_option_spl_cloud_backup_settings', [CronRunner::class, 'syncSchedule']);
+        add_action('update_option_spl_cloud_backup_settings', [CronRunner::class, 'syncSchedule']);
+
         // AJAX endpoints
         add_action('wp_ajax_spl_backup_manual_run', [$this, 'ajaxManualRun']);
         add_action('wp_ajax_spl_backup_test_drive', [$this, 'ajaxTestDrive']);
@@ -143,9 +147,6 @@ class Plugin
         $sanitized['retention_drive_count'] = max(1, (int) ($input['retention_drive_count'] ?? 14));
         $sanitized['delete_local_after_upload'] = !empty($input['delete_local_after_upload']) ? 1 : 0;
 
-        // Re-sync Cron when schedule settings change
-        add_action('update_option_spl_cloud_backup_settings', [CronRunner::class, 'syncSchedule']);
-
         return $sanitized;
     }
 
@@ -211,7 +212,7 @@ class Plugin
     }
 
     /**
-     * AJAX: Test Google Drive connection.
+     * AJAX: Test Google Drive connection (supports live unsaved form fields).
      */
     public function ajaxTestDrive(): void
     {
@@ -221,7 +222,28 @@ class Plugin
             wp_send_json_error(['message' => __('Không đủ quyền hạn.', 'spl-cloud-backup')]);
         }
 
-        $client = new GoogleDriveClient();
+        $settings = get_option('spl_cloud_backup_settings', []);
+        if (!is_array($settings)) {
+            $settings = [];
+        }
+
+        if (isset($_POST['drive_auth_type'])) {
+            $settings['drive_auth_type'] = ($_POST['drive_auth_type'] === 'oauth') ? 'oauth' : 'service_account';
+        }
+        if (isset($_POST['service_account_json'])) {
+            $settings['service_account_json'] = trim(wp_unslash((string) $_POST['service_account_json']));
+        }
+        if (isset($_POST['oauth_client_id'])) {
+            $settings['oauth_client_id'] = sanitize_text_field(wp_unslash((string) $_POST['oauth_client_id']));
+        }
+        if (isset($_POST['oauth_client_secret'])) {
+            $settings['oauth_client_secret'] = sanitize_text_field(wp_unslash((string) $_POST['oauth_client_secret']));
+        }
+        if (isset($_POST['oauth_refresh_token'])) {
+            $settings['oauth_refresh_token'] = sanitize_text_field(wp_unslash((string) $_POST['oauth_refresh_token']));
+        }
+
+        $client = new GoogleDriveClient($settings);
         $res = $client->testConnection();
 
         if ($res['success']) {

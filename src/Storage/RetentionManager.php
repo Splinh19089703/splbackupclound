@@ -39,20 +39,36 @@ class RetentionManager
             $logger(sprintf(__('Đã dọn dẹp %d bản sao lưu cục bộ cũ (giữ lại %d bản gần nhất).', 'spl-cloud-backup'), $stats['local_deleted'], $localKeep));
         }
 
-        // 2. Google Drive retention
+        // 2. Google Drive retention (grouped per category: DB vs Archive)
         if ($driveClient && !empty($folderId) && $driveKeep > 0) {
-            $driveFiles = $driveClient->listFilesInFolder($folderId, 100);
-            if (count($driveFiles) > $driveKeep) {
-                // files are ordered by createdTime desc
-                $toDelete = array_slice($driveFiles, $driveKeep);
-                foreach ($toDelete as $f) {
-                    if (!empty($f['id']) && $driveClient->deleteFile($f['id'])) {
-                        $stats['drive_deleted']++;
+            $driveFiles = $driveClient->listFilesInFolder($folderId, 200);
+            if (!empty($driveFiles)) {
+                $grouped = [
+                    'db'      => [],
+                    'archive' => [],
+                ];
+
+                foreach ($driveFiles as $f) {
+                    $name = strtolower((string) ($f['name'] ?? ''));
+                    $bucket = str_ends_with($name, '.sql.gz') || str_contains($name, '-db-') ? 'db' : 'archive';
+                    $grouped[$bucket][] = $f;
+                }
+
+                foreach ($grouped as $items) {
+                    if (count($items) <= $driveKeep) {
+                        continue;
+                    }
+                    // files are ordered by createdTime desc
+                    $toDelete = array_slice($items, $driveKeep);
+                    foreach ($toDelete as $f) {
+                        if (!empty($f['id']) && $driveClient->deleteFile($f['id'])) {
+                            $stats['drive_deleted']++;
+                        }
                     }
                 }
 
                 if ($logger && $stats['drive_deleted'] > 0) {
-                    $logger(sprintf(__('Đã dọn dẹp %d bản sao lưu cũ trên Google Drive (giữ lại %d bản gần nhất).', 'spl-cloud-backup'), $stats['drive_deleted'], $driveKeep));
+                    $logger(sprintf(__('Đã dọn dẹp %d bản sao lưu cũ trên Google Drive (giữ lại %d bản gần nhất mỗi loại).', 'spl-cloud-backup'), $stats['drive_deleted'], $driveKeep));
                 }
             }
         }

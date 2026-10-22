@@ -20,8 +20,9 @@ jQuery(document).ready(function ($) {
 
         // Update URL query string without page reload
         if (window.history && window.history.replaceState) {
-            var newUrl = window.location.pathname + window.location.search.replace(/&tab=[^&]*/, '') + '&tab=' + targetTab;
-            window.history.replaceState(null, null, newUrl);
+            var url = new URL(window.location.href);
+            url.searchParams.set('tab', targetTab);
+            window.history.replaceState(null, '', url.toString());
         }
     });
 
@@ -54,7 +55,12 @@ jQuery(document).ready(function ($) {
             dataType: 'json',
             data: {
                 action: 'spl_backup_test_drive',
-                nonce: backupData.nonce
+                nonce: backupData.nonce,
+                drive_auth_type: $('input[name="spl_cloud_backup_settings[drive_auth_type]"]:checked').val() || 'service_account',
+                service_account_json: $('textarea[name="spl_cloud_backup_settings[service_account_json]"]').val() || '',
+                oauth_client_id: $('input[name="spl_cloud_backup_settings[oauth_client_id]"]').val() || '',
+                oauth_client_secret: $('input[name="spl_cloud_backup_settings[oauth_client_secret]"]').val() || '',
+                oauth_refresh_token: $('input[name="spl_cloud_backup_settings[oauth_refresh_token]"]').val() || ''
             },
             success: function (res) {
                 $btn.prop('disabled', false);
@@ -161,7 +167,7 @@ jQuery(document).ready(function ($) {
 
         function addLog(msg) {
             var time = new Date().toTimeString().split(' ')[0];
-            $logs.append('<p>[' + time + '] ' + msg + '</p>');
+            $logs.append($('<p>').text('[' + time + '] ' + msg));
             $logs.scrollTop($logs[0].scrollHeight);
         }
 

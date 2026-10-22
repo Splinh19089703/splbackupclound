@@ -38,14 +38,17 @@ class EmailNotifier
 
         $allowAttach = !empty($this->settings['email_attach_files']);
 
-        foreach ($filesInfo as $file) {
+        foreach ($filesInfo as &$file) {
             $path = $file['path'] ?? '';
             $size = $file['size'] ?? 0;
 
             if ($allowAttach && file_exists($path) && $size > 0 && $size <= $attachThreshold) {
                 $attachments[] = $path;
+                $file['attached'] = true;
             }
         }
+        unset($file);
+        $backupSummary['files'] = $filesInfo;
 
         $htmlBody = $this->renderHtmlBody($backupSummary, $isSuccess);
 

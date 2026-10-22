@@ -179,7 +179,7 @@ class LocalVault
     }
 
     /**
-     * Clean old local backups exceeding the maximum allowed count.
+     * Clean old local backups exceeding the maximum allowed count per backup category (Database vs Archive).
      */
     public static function purgeOldBackups(int $keepCount): int
     {
@@ -188,15 +188,30 @@ class LocalVault
         }
 
         $backups = self::listBackups();
-        if (count($backups) <= $keepCount) {
+        if (empty($backups)) {
             return 0;
         }
 
-        $toDelete = array_slice($backups, $keepCount);
+        $grouped = [
+            'db'      => [],
+            'archive' => [],
+        ];
+
+        foreach ($backups as $item) {
+            $bucket = ($item['type'] === 'Database') ? 'db' : 'archive';
+            $grouped[$bucket][] = $item;
+        }
+
         $deleted = 0;
-        foreach ($toDelete as $item) {
-            if (self::deleteFile($item['filename'])) {
-                $deleted++;
+        foreach ($grouped as $items) {
+            if (count($items) <= $keepCount) {
+                continue;
+            }
+            $toDelete = array_slice($items, $keepCount);
+            foreach ($toDelete as $item) {
+                if (self::deleteFile($item['filename'])) {
+                    $deleted++;
+                }
             }
         }
 

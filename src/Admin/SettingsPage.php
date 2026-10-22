@@ -158,7 +158,6 @@ class SettingsPage
             <form id="spl-backup-settings-form" method="post" action="options.php" class="spl-form-container">
                 <?php
                 settings_fields('spl_cloud_backup_group');
-                wp_nonce_field('spl_backup_save_action', 'spl_backup_nonce');
                 ?>
 
                 <!-- TAB: GENERAL -->

@@ -104,43 +104,59 @@ class DatabaseDumper
      */
     private static function dumpWithCli(string $outputPath, ?callable $onProgress): array
     {
+        global $wpdb;
+
         if ($onProgress) {
             $onProgress(__('Bắt đầu sao lưu bằng lệnh mysqldump hệ thống...', 'spl-cloud-backup'), 10);
         }
 
-        $host = DB_HOST;
-        $port = 3306;
-        if (str_contains($host, ':')) {
-            [$host, $port] = explode(':', $host, 2);
+        $parsedHost = $wpdb->parse_db_host(DB_HOST);
+        $host = $parsedHost ? $parsedHost[0] : DB_HOST;
+        $port = $parsedHost ? $parsedHost[1] : null;
+        $socket = $parsedHost ? $parsedHost[2] : null;
+        $isIpv6 = $parsedHost ? $parsedHost[3] : false;
+
+        if ($isIpv6 && !str_starts_with($host, '[')) {
+            $host = "[{$host}]";
         }
 
-        $user = escapeshellarg(DB_USER);
-        $pass = escapeshellarg(DB_PASSWORD);
-        $dbName = escapeshellarg(DB_NAME);
-        $hostArg = escapeshellarg($host);
-        $portArg = escapeshellarg((string) $port);
+        $connArgs = ['--host=' . escapeshellarg($host)];
+        if (!empty($socket)) {
+            $connArgs[] = '--socket=' . escapeshellarg((string) $socket);
+        } elseif (!empty($port)) {
+            $connArgs[] = '--port=' . escapeshellarg((string) $port);
+        }
 
-        $tempSql = sys_get_temp_dir() . '/spl_dump_' . uniqid('', true) . '.sql';
+        $connArgs[] = '--user=' . escapeshellarg(DB_USER);
+        $connArgs[] = '--password=' . escapeshellarg(DB_PASSWORD);
+
+        $dbName = escapeshellarg(DB_NAME);
+        $uid = uniqid('', true);
+        $tempSql = sys_get_temp_dir() . '/spl_dump_' . $uid . '.sql';
+        $tempErr = sys_get_temp_dir() . '/spl_dump_err_' . $uid . '.log';
 
         $cmd = sprintf(
-            'mysqldump --host=%s --port=%s --user=%s --password=%s --single-transaction --quick --routines --triggers --skip-lock-tables %s > %s 2>&1',
-            $hostArg,
-            $portArg,
-            $user,
-            $pass,
+            'mysqldump %s --single-transaction --quick --routines --triggers --skip-lock-tables %s > %s 2> %s',
+            implode(' ', $connArgs),
             $dbName,
-            escapeshellarg($tempSql)
+            escapeshellarg($tempSql),
+            escapeshellarg($tempErr)
         );
 
         $out = [];
         $code = 1;
         @exec($cmd, $out, $code);
 
+        $errOutput = file_exists($tempErr) ? trim((string) file_get_contents($tempErr)) : '';
+        if (file_exists($tempErr)) {
+            @unlink($tempErr);
+        }
+
         if ($code !== 0 || !file_exists($tempSql) || filesize($tempSql) === 0) {
             if (file_exists($tempSql)) {
                 @unlink($tempSql);
             }
-            return ['success' => false, 'message' => implode("\n", $out)];
+            return ['success' => false, 'message' => $errOutput ?: implode("\n", $out)];
         }
 
         if ($onProgress) {
@@ -279,10 +295,8 @@ class DatabaseDumper
                     foreach ($row as $val) {
                         if ($val === null) {
                             $escapedValues[] = 'NULL';
-                        } elseif (is_numeric($val) && !str_starts_with((string)$val, '0')) {
-                            $escapedValues[] = $val;
                         } else {
-                            $escapedValues[] = "'" . esc_sql($val) . "'";
+                            $escapedValues[] = "'" . esc_sql((string) $val) . "'";
                         }
                     }
                     $valueLines[] = '(' . implode(', ', $escapedValues) . ')';
