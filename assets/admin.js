@@ -221,13 +221,31 @@ jQuery(document).ready(function ($) {
                         });
                     }
                     addLog('⚠️ ' + (res.data ? res.data.message : 'Lỗi không xác định'));
+
+                    if (res.data && res.data.is_locked) {
+                        var $unlockBtn = $('<button type="button" class="button button-secondary" style="margin-top: 10px;">')
+                            .text('🔓 Mở khóa tiến trình & Thử lại ngay')
+                            .on('click', function () {
+                                $(this).prop('disabled', true).text('Đang mở khóa...');
+                                $.post(backupData.ajax_url, {
+                                    action: 'spl_backup_force_unlock',
+                                    nonce: backupData.nonce
+                                }, function () {
+                                    addLog('Đã mở khóa thành công. Bắt đầu chạy lại sao lưu...');
+                                    $('#btn-start-manual-backup').trigger('click');
+                                });
+                            });
+                        $logs.append($('<p>').append($unlockBtn));
+                        $logs.scrollTop($logs[0].scrollHeight);
+                    }
                 }
             },
             error: function (xhr, status, error) {
                 clearInterval(progressTimer);
                 $btn.prop('disabled', false).removeClass('updating-message');
                 $badge.removeClass('badge-info badge-success').addClass('badge-error').text('Lỗi kết nối');
-                addLog('LỖI KẾT NỐI MÁY CHỦ: ' + (error || status));
+                addLog('LỖI KẾT NỐI MÁY CHỦ: ' + (error || status) + ' (HTTP ' + (xhr.status || 'Timeout') + ')');
+                addLog('Gợi ý: Vui lòng tải lại trang hoặc kiểm tra tab "Tệp tin & Lịch sử" xem tiến trình chạy ngầm đã tạo file hay chưa.');
             }
         });
     });

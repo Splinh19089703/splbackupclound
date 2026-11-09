@@ -28,6 +28,7 @@ class CronRunner
 
         // Hook aaPanel / Server Cron Webhook listener
         add_action('init', [__CLASS__, 'handleWebhookTrigger']);
+        add_action('init', [__CLASS__, 'maybeSyncDiagnosticsFile'], 20);
     }
 
     /**
@@ -139,14 +140,29 @@ class CronRunner
     public static function runFullBackup(string $triggerMode = 'Thủ công', ?callable $logger = null, array $overrides = []): array
     {
         $lockKey = 'spl_backup_is_running';
-        if (get_transient($lockKey)) {
-            return [
-                'success' => false,
-                'message' => __('Một tiến trình sao lưu khác đang chạy trên hệ thống. Vui lòng thử lại sau ít phút.', 'spl-cloud-backup'),
-            ];
+        $lockVal = get_transient($lockKey);
+        $isForced = !empty($overrides['force_unlock']);
+
+        // Auto-release stale lock older than 300 seconds (5 minutes)
+        if ($lockVal && !$isForced) {
+            $lockAge = time() - (int) $lockVal;
+            if ($lockAge < 300) {
+                return [
+                    'success'   => false,
+                    'is_locked' => true,
+                    'message'   => __('Một tiến trình sao lưu khác đang chạy trên hệ thống. Vui lòng chờ ít phút hoặc bấm "Mở khóa & Thử lại".', 'spl-cloud-backup'),
+                ];
+            }
         }
 
-        set_transient($lockKey, time(), 1800); // 30 minutes lock
+        set_transient($lockKey, time(), 600); // 10 minutes lock instead of 30
+        if (function_exists('ignore_user_abort')) {
+            @ignore_user_abort(true);
+        }
+        if (function_exists('set_time_limit')) {
+            @set_time_limit(1800);
+        }
+        @ini_set('memory_limit', '1024M');
 
         $startTime = microtime(true);
         $savedSettings = get_option('spl_cloud_backup_settings', []);
@@ -246,10 +262,17 @@ class CronRunner
                     unset($fInfo);
                 } else {
                     $overallSuccess = false;
-                    $logFn(__('Không thể tạo hoặc truy cập thư mục lưu trữ trên Google Drive.', 'spl-cloud-backup'), 88);
+                    $driveErr = $driveClient->getLastError();
+                    $errDetail = $driveErr !== '' ? ' Chi tiết: ' . $driveErr : '';
+                    $logFn(__('Không thể tạo hoặc truy cập thư mục lưu trữ trên Google Drive.', 'spl-cloud-backup') . $errDetail, 88);
                 }
             }
+        } catch (\Throwable $e) {
+            $overallSuccess = false;
+            $logFn(__('LỖI HỆ THỐNG: ', 'spl-cloud-backup') . $e->getMessage(), 89);
+        }
 
+        try {
             // 4. Send Email Notification (if enabled)
             $enableEmail = !empty($settings['enable_email_report']);
             if ($enableEmail) {
@@ -275,12 +298,12 @@ class CronRunner
             // 5. Retention Management
             $logFn(__('Đang thực hiện quy chế dọn dẹp các bản sao lưu cũ (Retention)...', 'spl-cloud-backup'), 95);
             $retention = new RetentionManager($settings);
-            $retention->execute($driveClient, $folderId, function ($msg) use ($logFn) {
+            $retention->execute($driveClient ?? null, $folderId ?? null, function ($msg) use ($logFn) {
                 $logFn($msg, 97);
             });
 
             // 6. Delete local files after upload if option is checked
-            if (!empty($settings['delete_local_after_upload']) && $enableDrive) {
+            if (!empty($settings['delete_local_after_upload']) && !empty($enableDrive)) {
                 foreach ($createdFiles as $fInfo) {
                     if (!empty($fInfo['drive_link']) && file_exists($fInfo['path'])) {
                         @unlink($fInfo['path']);
@@ -289,8 +312,7 @@ class CronRunner
                 }
             }
         } catch (\Throwable $e) {
-            $overallSuccess = false;
-            $logFn(__('LỖI HỆ THỐNG: ', 'spl-cloud-backup') . $e->getMessage(), 100);
+            $logFn(__('LỖI HẬU XỬ LÝ: ', 'spl-cloud-backup') . $e->getMessage(), 99);
         } finally {
             delete_transient($lockKey);
         }
@@ -334,5 +356,74 @@ class CronRunner
         $history = array_slice($history, 0, 25);
 
         update_option('spl_cloud_backup_history', $history, false);
+        self::syncHistoryFile($history);
+    }
+
+    /**
+     * Ensure backup-history.json exists in the protected local vault for diagnostics.
+     */
+    public static function maybeSyncDiagnosticsFile(): void
+    {
+        $vaultDir = LocalVault::getVaultPath();
+        $diagFile = $vaultDir . '/backup-history.json';
+        if (!file_exists($diagFile)) {
+            $history = get_option('spl_cloud_backup_history', []);
+            self::syncHistoryFile(is_array($history) ? $history : []);
+        }
+    }
+
+    /**
+     * Write non-sensitive diagnostics and execution history to the protected vault directory.
+     *
+     * @param array<int, array<string, mixed>> $history
+     */
+    public static function syncHistoryFile(array $history): void
+    {
+        if (!LocalVault::ensureVaultExists()) {
+            return;
+        }
+
+        $settings = get_option('spl_cloud_backup_settings', []);
+        if (!is_array($settings)) {
+            $settings = [];
+        }
+
+        $nextTs = wp_next_scheduled(self::CRON_HOOK);
+        $driveDiag = null;
+        if (!empty($settings['enable_google_drive'])) {
+            $client = new GoogleDriveClient($settings);
+            $driveDiag = $client->testConnection();
+        }
+
+        $payload = [
+            'updated_at'  => wp_date('Y-m-d H:i:s'),
+            'site_url'    => home_url('/'),
+            'diagnostics' => [
+                'backup_type'             => $settings['backup_type'] ?? 'db_only',
+                'enable_google_drive'     => !empty($settings['enable_google_drive']),
+                'drive_auth_type'         => $settings['drive_auth_type'] ?? 'service_account',
+                'drive_folder_name'       => $settings['drive_folder_name'] ?? '',
+                'has_oauth_client_id'     => !empty($settings['oauth_client_id']),
+                'has_oauth_client_secret' => !empty($settings['oauth_client_secret']),
+                'has_oauth_refresh_token' => !empty($settings['oauth_refresh_token']),
+                'has_service_account'     => !empty($settings['service_account_json']),
+                'enable_email_report'     => !empty($settings['enable_email_report']),
+                'email_attach_files'      => !empty($settings['email_attach_files']),
+                'schedule_frequency'      => $settings['schedule_frequency'] ?? 'daily',
+                'schedule_time'           => $settings['schedule_time'] ?? '02:00',
+                'next_scheduled_ts'       => $nextTs ?: null,
+                'next_scheduled_local'    => $nextTs ? wp_date('Y-m-d H:i:s', $nextTs) : null,
+                'retention_local_count'   => (int) ($settings['retention_local_count'] ?? 5),
+                'retention_drive_count'   => (int) ($settings['retention_drive_count'] ?? 14),
+                'delete_local_after'      => !empty($settings['delete_local_after_upload']),
+                'zip_archive_loaded'      => class_exists('\ZipArchive'),
+                'proc_open_enabled'       => function_exists('proc_open'),
+                'drive_test'              => $driveDiag,
+            ],
+            'history'     => $history,
+        ];
+
+        $diagFile = LocalVault::getVaultPath() . '/backup-history.json';
+        @file_put_contents($diagFile, wp_json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
     }
 }

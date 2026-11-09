@@ -60,6 +60,8 @@ class Plugin
         // Admin menu & settings
         add_action('admin_menu', [$this, 'registerAdminMenu']);
         add_action('admin_init', [$this, 'registerSettings']);
+        add_action('admin_init', [$this, 'handleOAuthRedirect']);
+        add_action('admin_init', [$this, 'handleOAuthCallback']);
         add_action('admin_enqueue_scripts', [$this, 'enqueueAdminAssets']);
 
         // Re-sync Cron when schedule settings are added or updated
@@ -68,12 +70,14 @@ class Plugin
 
         // AJAX endpoints
         add_action('wp_ajax_spl_backup_manual_run', [$this, 'ajaxManualRun']);
+        add_action('wp_ajax_spl_backup_force_unlock', [$this, 'ajaxForceUnlock']);
         add_action('wp_ajax_spl_backup_test_drive', [$this, 'ajaxTestDrive']);
         add_action('wp_ajax_spl_backup_test_mail', [$this, 'ajaxTestMail']);
         add_action('wp_ajax_spl_backup_delete_local', [$this, 'ajaxDeleteLocal']);
 
         // Legacy / fallback AJAX support
         add_action('wp_ajax_hd_backup_manual_run', [$this, 'ajaxManualRun']);
+        add_action('wp_ajax_hd_backup_force_unlock', [$this, 'ajaxForceUnlock']);
         add_action('wp_ajax_hd_backup_test_drive', [$this, 'ajaxTestDrive']);
         add_action('wp_ajax_hd_backup_test_mail', [$this, 'ajaxTestMail']);
         add_action('wp_ajax_hd_backup_delete_local', [$this, 'ajaxDeleteLocal']);
@@ -120,19 +124,31 @@ class Plugin
             return [];
         }
 
+        $existing = get_option('spl_cloud_backup_settings', []);
+        if (!is_array($existing)) {
+            $existing = [];
+        }
+
         $sanitized = [];
         $sanitized['backup_type'] = in_array($input['backup_type'] ?? '', ['db_only', 'db_and_files', 'full'], true)
             ? $input['backup_type']
-            : 'db_only';
+            : ($existing['backup_type'] ?? 'db_only');
 
         $sanitized['custom_excludes'] = sanitize_textarea_field($input['custom_excludes'] ?? '');
         $sanitized['enable_google_drive'] = !empty($input['enable_google_drive']) ? 1 : 0;
         $sanitized['drive_auth_type'] = ($input['drive_auth_type'] ?? '') === 'oauth' ? 'oauth' : 'service_account';
 
-        $sanitized['service_account_json'] = trim($input['service_account_json'] ?? '');
+        $submittedSaJson = trim($input['service_account_json'] ?? '');
+        $sanitized['service_account_json'] = $submittedSaJson !== '' ? $submittedSaJson : ($existing['service_account_json'] ?? '');
+
         $sanitized['oauth_client_id'] = sanitize_text_field($input['oauth_client_id'] ?? '');
-        $sanitized['oauth_client_secret'] = sanitize_text_field($input['oauth_client_secret'] ?? '');
-        $sanitized['oauth_refresh_token'] = sanitize_text_field($input['oauth_refresh_token'] ?? '');
+
+        $submittedSecret = sanitize_text_field($input['oauth_client_secret'] ?? '');
+        $sanitized['oauth_client_secret'] = $submittedSecret !== '' ? $submittedSecret : ($existing['oauth_client_secret'] ?? '');
+
+        $submittedRefresh = sanitize_text_field($input['oauth_refresh_token'] ?? '');
+        $sanitized['oauth_refresh_token'] = $submittedRefresh !== '' ? $submittedRefresh : ($existing['oauth_refresh_token'] ?? '');
+
         $sanitized['drive_folder_name'] = sanitize_text_field($input['drive_folder_name'] ?? '');
 
         $sanitized['enable_email_report'] = !empty($input['enable_email_report']) ? 1 : 0;
@@ -202,13 +218,33 @@ class Plugin
         }
         @ini_set('memory_limit', '1024M');
 
-        $result = CronRunner::runFullBackup('Thủ công (Admin Dashboard)');
+        $overrides = [];
+        if (!empty($_POST['force_unlock'])) {
+            $overrides['force_unlock'] = true;
+        }
+
+        $result = CronRunner::runFullBackup('Thủ công (Admin Dashboard)', null, $overrides);
 
         if ($result['success']) {
             wp_send_json_success($result);
         } else {
             wp_send_json_error($result);
         }
+    }
+
+    /**
+     * AJAX: Force unlock running backup process.
+     */
+    public function ajaxForceUnlock(): void
+    {
+        check_ajax_referer('spl_backup_ajax_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => __('Không đủ quyền hạn.', 'spl-cloud-backup')]);
+        }
+
+        delete_transient('spl_backup_is_running');
+        wp_send_json_success(['message' => __('Đã mở khóa tiến trình sao lưu thành công.', 'spl-cloud-backup')]);
     }
 
     /**
@@ -340,5 +376,108 @@ class Plugin
 
         readfile($path);
         exit;
+    }
+
+    /**
+     * Handle OAuth connect button redirect to Google.
+     */
+    public function handleOAuthRedirect(): void
+    {
+        if (!isset($_GET['spl_oauth']) || $_GET['spl_oauth'] !== 'connect') {
+            return;
+        }
+
+        if (!current_user_can('manage_options')) {
+            wp_die(__('Bạn không có quyền thực hiện hành động này.', 'spl-cloud-backup'));
+        }
+
+        check_admin_referer('spl_oauth_connect');
+
+        $settings = get_option('spl_cloud_backup_settings', []);
+        $clientId = trim($settings['oauth_client_id'] ?? '');
+
+        if (empty($clientId)) {
+            wp_die(__('Vui lòng nhập Client ID và bấm "Lưu cài đặt" trước khi liên kết.', 'spl-cloud-backup'));
+        }
+
+        $redirectUri = admin_url('admin.php?page=spl-cloud-backup&spl_oauth=callback');
+        $authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' . http_build_query([
+            'client_id'             => $clientId,
+            'redirect_uri'          => $redirectUri,
+            'response_type'         => 'code',
+            'scope'                 => 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive',
+            'access_type'           => 'offline',
+            'prompt'                => 'consent',
+            'state'                 => wp_create_nonce('spl_oauth_state'),
+        ]);
+
+        wp_redirect($authUrl);
+        exit;
+    }
+
+    /**
+     * Handle OAuth authorization callback from Google.
+     */
+    public function handleOAuthCallback(): void
+    {
+        if (!isset($_GET['spl_oauth']) || $_GET['spl_oauth'] !== 'callback') {
+            return;
+        }
+
+        if (!current_user_can('manage_options')) {
+            wp_die(__('Bạn không có quyền thực hiện hành động này.', 'spl-cloud-backup'));
+        }
+
+        $code = sanitize_text_field(wp_unslash((string) ($_GET['code'] ?? '')));
+        $error = sanitize_text_field(wp_unslash((string) ($_GET['error'] ?? '')));
+
+        if ($error) {
+            wp_redirect(add_query_arg([
+                'tab'           => 'drive',
+                'spl_oauth_err' => $error,
+            ], admin_url('admin.php?page=spl-cloud-backup')));
+            exit;
+        }
+
+        if (empty($code)) {
+            return;
+        }
+
+        $settings = get_option('spl_cloud_backup_settings', []);
+        $clientId = trim($settings['oauth_client_id'] ?? '');
+        $clientSecret = trim($settings['oauth_client_secret'] ?? '');
+        $redirectUri = admin_url('admin.php?page=spl-cloud-backup&spl_oauth=callback');
+
+        $response = wp_remote_post('https://oauth2.googleapis.com/token', [
+            'timeout' => 30,
+            'body'    => [
+                'code'          => $code,
+                'client_id'     => $clientId,
+                'client_secret' => $clientSecret,
+                'redirect_uri'  => $redirectUri,
+                'grant_type'    => 'authorization_code',
+            ],
+        ]);
+
+        if (is_wp_error($response)) {
+            wp_die(sprintf(__('Lỗi kết nối tới Google OAuth API: %s', 'spl-cloud-backup'), $response->get_error_message()));
+        }
+
+        $body = json_decode(wp_remote_retrieve_body($response), true);
+        if (!empty($body['refresh_token'])) {
+            $settings['oauth_refresh_token'] = $body['refresh_token'];
+            $settings['drive_auth_type'] = 'oauth';
+            $settings['enable_google_drive'] = 1;
+            update_option('spl_cloud_backup_settings', $settings);
+
+            wp_redirect(add_query_arg([
+                'tab'               => 'drive',
+                'spl_oauth_success' => 1,
+            ], admin_url('admin.php?page=spl-cloud-backup')));
+            exit;
+        }
+
+        $errMsg = $body['error_description'] ?? ($body['error'] ?? __('Không nhận được refresh token từ Google.', 'spl-cloud-backup'));
+        wp_die(sprintf(__('Lỗi xác thực OAuth từ Google: %s', 'spl-cloud-backup'), esc_html($errMsg)));
     }
 }

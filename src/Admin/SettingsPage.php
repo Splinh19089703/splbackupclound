@@ -223,12 +223,12 @@ class SettingsPage
                             <label class="spl-field-label"><?php esc_html_e('Phương thức xác thực:', 'spl-cloud-backup'); ?></label>
                             <div class="spl-field-input">
                                 <label class="spl-radio-inline">
-                                    <input type="radio" name="spl_cloud_backup_settings[drive_auth_type]" value="service_account" <?php checked($settings['drive_auth_type'] ?? 'service_account', 'service_account'); ?>>
-                                    <?php esc_html_e('Google Service Account JSON (Khuyến nghị cho Máy chủ / VPS)', 'spl-cloud-backup'); ?>
+                                    <input type="radio" name="spl_cloud_backup_settings[drive_auth_type]" value="oauth" <?php checked($settings['drive_auth_type'] ?? 'oauth', 'oauth'); ?>>
+                                    <strong><?php esc_html_e('OAuth 2.0 - Client ID / Refresh Token (Khuyến nghị cho Google Drive cá nhân)', 'spl-cloud-backup'); ?></strong>
                                 </label>
                                 <label class="spl-radio-inline" style="margin-left: 20px;">
-                                    <input type="radio" name="spl_cloud_backup_settings[drive_auth_type]" value="oauth" <?php checked($settings['drive_auth_type'] ?? 'service_account', 'oauth'); ?>>
-                                    <?php esc_html_e('OAuth 2.0 (Client ID / Refresh Token)', 'spl-cloud-backup'); ?>
+                                    <input type="radio" name="spl_cloud_backup_settings[drive_auth_type]" value="service_account" <?php checked($settings['drive_auth_type'] ?? 'oauth', 'service_account'); ?>>
+                                    <?php esc_html_e('Google Service Account JSON (Chỉ dùng cho Google Workspace Shared Drive)', 'spl-cloud-backup'); ?>
                                 </label>
                             </div>
                         </div>
@@ -238,9 +238,12 @@ class SettingsPage
                             <div class="spl-field-row">
                                 <label class="spl-field-label"><?php esc_html_e('Nội dung Service Account JSON:', 'spl-cloud-backup'); ?></label>
                                 <div class="spl-field-input">
+                                    <div style="background: #fffbeb; border-left: 4px solid #f59e0b; padding: 10px 14px; margin-bottom: 10px; border-radius: 4px; color: #92400e; font-size: 13px;">
+                                        <strong>⚠️ Lưu ý quan trọng từ Google Cloud:</strong> Tài khoản Service Account (<code>*.iam.gserviceaccount.com</code>) có hạn mức bộ nhớ <strong>0 Byte (0 B / 0 B)</strong> nên sẽ báo lỗi <code>Service Accounts do not have storage quota</code> khi tải tệp lên Google Drive cá nhân (My Drive). Vui lòng chọn <strong>OAuth 2.0 (Client ID / Refresh Token)</strong> bên trên để sử dụng chính dung lượng Google Drive (15GB+) của bạn.
+                                    </div>
                                     <textarea name="spl_cloud_backup_settings[service_account_json]" rows="6" class="large-text code" placeholder='{"type": "service_account", "project_id": "...", "private_key": "...", "client_email": "..."}'><?php echo esc_textarea($settings['service_account_json'] ?? ''); ?></textarea>
                                     <p class="description">
-                                        <?php esc_html_e('Mở tệp JSON Service Account tải từ Google Cloud Console, copy toàn bộ nội dung và dán vào đây. Plugin sẽ tự tạo JWT Token mã hóa RSA SHA-256 nội bộ mà không cần nạp thư viện Google nặng.', 'spl-cloud-backup'); ?>
+                                        <?php esc_html_e('Chỉ sử dụng Service Account nếu bạn đang đẩy bản sao lưu vào Bộ nhớ dùng chung (Shared Drives) của Google Workspace doanh nghiệp.', 'spl-cloud-backup'); ?>
                                     </p>
                                 </div>
                             </div>
@@ -248,22 +251,50 @@ class SettingsPage
 
                         <!-- OAuth Block -->
                         <div id="drive-auth-oauth" class="spl-auth-block" style="display: none;">
+                            <?php
+                            $redirectUri = admin_url('admin.php?page=spl-cloud-backup&spl_oauth=callback');
+                            $oauthConnectUrl = wp_nonce_url(admin_url('admin.php?page=spl-cloud-backup&spl_oauth=connect'), 'spl_oauth_connect');
+                            $hasToken = !empty($settings['oauth_refresh_token']);
+                            ?>
+                            <div class="spl-field-row">
+                                <label class="spl-field-label"><?php esc_html_e('Authorized Redirect URI:', 'spl-cloud-backup'); ?></label>
+                                <div class="spl-field-input">
+                                    <input type="text" class="large-text code" readonly value="<?php echo esc_attr($redirectUri); ?>" onclick="this.select();">
+                                    <p class="description"><?php esc_html_e('Sao chép URI này dán vào mục "Authorized redirect URIs" trong Google Cloud Console khi tạo OAuth Client ID.', 'spl-cloud-backup'); ?></p>
+                                </div>
+                            </div>
                             <div class="spl-field-row">
                                 <label class="spl-field-label"><?php esc_html_e('Client ID:', 'spl-cloud-backup'); ?></label>
                                 <div class="spl-field-input">
-                                    <input type="text" name="spl_cloud_backup_settings[oauth_client_id]" class="regular-text" value="<?php echo esc_attr($settings['oauth_client_id'] ?? ''); ?>">
+                                    <input type="text" name="spl_cloud_backup_settings[oauth_client_id]" class="large-text" value="<?php echo esc_attr($settings['oauth_client_id'] ?? ''); ?>" placeholder="xxxx.apps.googleusercontent.com">
                                 </div>
                             </div>
                             <div class="spl-field-row">
                                 <label class="spl-field-label"><?php esc_html_e('Client Secret:', 'spl-cloud-backup'); ?></label>
                                 <div class="spl-field-input">
-                                    <input type="password" name="spl_cloud_backup_settings[oauth_client_secret]" class="regular-text" value="<?php echo esc_attr($settings['oauth_client_secret'] ?? ''); ?>">
+                                    <input type="password" name="spl_cloud_backup_settings[oauth_client_secret]" class="large-text" value="<?php echo esc_attr($settings['oauth_client_secret'] ?? ''); ?>">
                                 </div>
                             </div>
                             <div class="spl-field-row">
-                                <label class="spl-field-label"><?php esc_html_e('Refresh Token:', 'spl-cloud-backup'); ?></label>
+                                <label class="spl-field-label"><?php esc_html_e('Trạng thái xác thực:', 'spl-cloud-backup'); ?></label>
                                 <div class="spl-field-input">
-                                    <input type="text" name="spl_cloud_backup_settings[oauth_refresh_token]" class="large-text" value="<?php echo esc_attr($settings['oauth_refresh_token'] ?? ''); ?>">
+                                    <?php if ($hasToken): ?>
+                                        <span class="spl-badge badge-success" style="padding: 6px 12px; font-size: 13px; display: inline-block; margin-bottom: 8px;">
+                                            ✓ <?php esc_html_e('Đã liên kết Google Account thành công!', 'spl-cloud-backup'); ?>
+                                        </span>
+                                        <br>
+                                        <a href="<?php echo esc_url($oauthConnectUrl); ?>" class="button button-secondary">
+                                            <span class="dashicons dashicons-update"></span> <?php esc_html_e('Ủy quyền liên kết lại', 'spl-cloud-backup'); ?>
+                                        </a>
+                                    <?php else: ?>
+                                        <p class="description" style="margin-bottom: 8px; color: #b45309;">
+                                            <?php esc_html_e('Sau khi nhập Client ID & Secret và bấm "Lưu cài đặt", hãy bấm nút bên dưới để cấp quyền kết nối tới Google Drive:', 'spl-cloud-backup'); ?>
+                                        </p>
+                                        <a href="<?php echo esc_url($oauthConnectUrl); ?>" class="button button-primary button-hero">
+                                            <span class="dashicons dashicons-google"></span> <?php esc_html_e('Ủy quyền kết nối Google Drive ngay', 'spl-cloud-backup'); ?>
+                                        </a>
+                                    <?php endif; ?>
+                                    <input type="hidden" name="spl_cloud_backup_settings[oauth_refresh_token]" value="<?php echo esc_attr($settings['oauth_refresh_token'] ?? ''); ?>">
                                 </div>
                             </div>
                         </div>
@@ -486,6 +517,14 @@ class SettingsPage
                                                     </li>
                                                 <?php endforeach; ?>
                                             </ul>
+                                        <?php endif; ?>
+                                        <?php if (!empty($h['logs']) && is_array($h['logs'])): ?>
+                                            <details style="margin-top: 8px;">
+                                                <summary style="cursor: pointer; font-size: 12px; color: #475569; font-weight: 500;">
+                                                    <?php esc_html_e('Xem nhật ký chi tiết (Execution Logs)', 'spl-cloud-backup'); ?>
+                                                </summary>
+                                                <pre style="margin-top: 6px; padding: 10px 12px; background: #0f172a; color: #cbd5e1; border-radius: 6px; font-size: 12px; line-height: 1.5; max-height: 220px; overflow-y: auto; white-space: pre-wrap;"><?php echo esc_html(implode("\n", $h['logs'])); ?></pre>
+                                            </details>
                                         <?php endif; ?>
                                     </div>
                                 <?php endforeach; ?>

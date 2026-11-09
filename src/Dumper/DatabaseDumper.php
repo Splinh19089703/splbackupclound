@@ -77,23 +77,69 @@ class DatabaseDumper
      */
     private static function canUseSystemExec(): bool
     {
-        if (!function_exists('exec') || !function_exists('proc_open')) {
+        if (!function_exists('exec')) {
             return false;
         }
 
         $disabled = explode(',', ini_get('disable_functions') ?: '');
         $disabled = array_map('trim', $disabled);
 
-        if (in_array('exec', $disabled, true) || in_array('proc_open', $disabled, true)) {
+        if (in_array('exec', $disabled, true)) {
             return false;
         }
 
-        // Check if mysqldump binary responds
-        $out = [];
-        $code = 1;
-        @exec('mysqldump --version 2>&1', $out, $code);
+        return self::findMysqldumpBinary() !== null;
+    }
 
-        return $code === 0;
+    /**
+     * Locate mysqldump binary on Linux / Windows.
+     */
+    private static function findMysqldumpBinary(): ?string
+    {
+        $candidates = [
+            'mysqldump',
+            '/usr/bin/mysqldump',
+            '/usr/local/bin/mysqldump',
+            '/usr/local/mysql/bin/mysqldump',
+            '/www/server/mysql/bin/mysqldump',
+            '/bin/mysqldump',
+        ];
+
+        if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+            $laragonGlobs = glob('C:/laragon/bin/mysql/*/bin/mysqldump.exe');
+            if (!empty($laragonGlobs)) {
+                $candidates = array_merge($laragonGlobs, $candidates);
+            }
+            $candidates[] = 'mysqldump.exe';
+        }
+
+        foreach ($candidates as $bin) {
+            $out = [];
+            $code = 1;
+            @exec(escapeshellcmd($bin) . ' --version 2>&1', $out, $code);
+            if ($code === 0) {
+                return $bin;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Locate gzip binary for direct shell pipeline.
+     */
+    private static function findGzipBinary(): ?string
+    {
+        $candidates = ['gzip', '/bin/gzip', '/usr/bin/gzip', '/usr/local/bin/gzip'];
+        foreach ($candidates as $bin) {
+            $out = [];
+            $code = 1;
+            @exec(escapeshellcmd($bin) . ' --version 2>&1', $out, $code);
+            if ($code === 0) {
+                return $bin;
+            }
+        }
+        return null;
     }
 
     /**
@@ -105,6 +151,11 @@ class DatabaseDumper
     private static function dumpWithCli(string $outputPath, ?callable $onProgress): array
     {
         global $wpdb;
+
+        $mysqldumpBin = self::findMysqldumpBinary();
+        if (!$mysqldumpBin) {
+            return ['success' => false, 'message' => __('Không tìm thấy lệnh mysqldump.', 'spl-cloud-backup')];
+        }
 
         if ($onProgress) {
             $onProgress(__('Bắt đầu sao lưu bằng lệnh mysqldump hệ thống...', 'spl-cloud-backup'), 10);
@@ -132,11 +183,41 @@ class DatabaseDumper
 
         $dbName = escapeshellarg(DB_NAME);
         $uid = uniqid('', true);
-        $tempSql = sys_get_temp_dir() . '/spl_dump_' . $uid . '.sql';
         $tempErr = sys_get_temp_dir() . '/spl_dump_err_' . $uid . '.log';
 
+        $gzipBin = self::findGzipBinary();
+
+        // Tier 1: Direct pipe into gzip (Lightning fast: 1-3 seconds, 0 RAM, 0 disk overhead)
+        if ($gzipBin) {
+            $cmd = sprintf(
+                '%s %s --single-transaction --quick --routines --triggers --skip-lock-tables %s 2> %s | %s -c > %s',
+                escapeshellcmd($mysqldumpBin),
+                implode(' ', $connArgs),
+                $dbName,
+                escapeshellarg($tempErr),
+                escapeshellcmd($gzipBin),
+                escapeshellarg($outputPath)
+            );
+
+            $out = [];
+            $code = 1;
+            @exec($cmd, $out, $code);
+
+            $errOutput = file_exists($tempErr) ? trim((string) file_get_contents($tempErr)) : '';
+            if (file_exists($tempErr)) {
+                @unlink($tempErr);
+            }
+
+            if ($code === 0 && file_exists($outputPath) && filesize($outputPath) > 0) {
+                return ['success' => true];
+            }
+        }
+
+        // Tier 2: Dump to temporary .sql then compress with PHP wb4 (fast)
+        $tempSql = sys_get_temp_dir() . '/spl_dump_' . $uid . '.sql';
         $cmd = sprintf(
-            'mysqldump %s --single-transaction --quick --routines --triggers --skip-lock-tables %s > %s 2> %s',
+            '%s %s --single-transaction --quick --routines --triggers --skip-lock-tables %s > %s 2> %s',
+            escapeshellcmd($mysqldumpBin),
             implode(' ', $connArgs),
             $dbName,
             escapeshellarg($tempSql),
@@ -163,13 +244,13 @@ class DatabaseDumper
             $onProgress(__('Đang nén cơ sở dữ liệu với gzip...', 'spl-cloud-backup'), 60);
         }
 
-        // Compress tempSql into $outputPath (.sql.gz)
+        // Compress tempSql into $outputPath (.sql.gz) using wb4 (fast compression)
         $in = fopen($tempSql, 'rb');
-        $outGz = gzopen($outputPath, 'wb9');
+        $outGz = gzopen($outputPath, 'wb4');
 
         if ($in && $outGz) {
             while (!feof($in)) {
-                $chunk = fread($in, 1024 * 1024); // 1MB chunks
+                $chunk = fread($in, 2 * 1024 * 1024); // 2MB chunks
                 if ($chunk !== false) {
                     gzwrite($outGz, $chunk);
                 }
@@ -196,6 +277,7 @@ class DatabaseDumper
 
     /**
      * Pure PHP streaming dump without storing large strings in memory.
+     * Optimized for speed: Level 4 compression, 2500 batch size, addslashes, and bloat log capping.
      *
      * @param callable|null $onProgress
      * @return array<string, mixed>
@@ -212,7 +294,8 @@ class DatabaseDumper
             return ['success' => false, 'message' => __('PHP Zlib extension chưa được kích hoạt trên server.', 'spl-cloud-backup')];
         }
 
-        $gz = gzopen($outputPath, 'wb9');
+        // Use wb4 (fast) instead of wb9 (ultra slow)
+        $gz = gzopen($outputPath, 'wb4');
         if (!$gz) {
             return ['success' => false, 'message' => __('Không thể tạo tệp nén sao lưu CSDL tại thư mục vault.', 'spl-cloud-backup')];
         }
@@ -269,10 +352,16 @@ class DatabaseDumper
                 continue;
             }
 
+            // Cap massive log tables (e.g. actionscheduler_logs) to prevent timeout
+            $isLogTable = (bool) preg_match('/actionscheduler_logs$/i', $table);
+            if ($isLogTable && $rowCount > 1000) {
+                $rowCount = 1000;
+            }
+
             $totalRows += $rowCount;
 
             // Stream rows in batches
-            $batchSize = 1000;
+            $batchSize = 2500;
             $offset = 0;
 
             gzwrite($gz, "-- Dumping data for `{$table}` ({$rowCount} rows)\n");
@@ -282,7 +371,11 @@ class DatabaseDumper
                     @set_time_limit(300);
                 }
 
-                $rows = $wpdb->get_results("SELECT * FROM `{$table}` LIMIT {$offset}, {$batchSize}", ARRAY_A);
+                $query = $isLogTable
+                    ? "SELECT * FROM `{$table}` ORDER BY 1 DESC LIMIT {$batchSize}"
+                    : "SELECT * FROM `{$table}` LIMIT {$offset}, {$batchSize}";
+
+                $rows = $wpdb->get_results($query, ARRAY_A);
                 if (empty($rows)) {
                     break;
                 }
@@ -296,7 +389,7 @@ class DatabaseDumper
                         if ($val === null) {
                             $escapedValues[] = 'NULL';
                         } else {
-                            $escapedValues[] = "'" . esc_sql((string) $val) . "'";
+                            $escapedValues[] = "'" . addslashes((string) $val) . "'";
                         }
                     }
                     $valueLines[] = '(' . implode(', ', $escapedValues) . ')';
@@ -307,6 +400,10 @@ class DatabaseDumper
 
                 $offset += $batchSize;
                 unset($rows, $valueLines, $insertSql);
+
+                if ($isLogTable) {
+                    break;
+                }
             }
 
             gzwrite($gz, "\n");

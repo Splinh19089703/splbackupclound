@@ -8,10 +8,16 @@ class GoogleDriveClient
 {
     private array $settings;
     private ?string $accessToken = null;
+    private string $lastError = '';
 
     public function __construct(?array $settings = null)
     {
         $this->settings = $settings ?? get_option('spl_cloud_backup_settings', []);
+    }
+
+    public function getLastError(): string
+    {
+        return $this->lastError;
     }
 
     /**
@@ -62,11 +68,13 @@ class GoogleDriveClient
     {
         $jsonString = trim($this->settings['service_account_json'] ?? '');
         if (empty($jsonString)) {
+            $this->lastError = 'Chưa nhập nội dung Service Account JSON.';
             return null;
         }
 
         $data = json_decode($jsonString, true);
         if (!is_array($data) || empty($data['client_email']) || empty($data['private_key'])) {
+            $this->lastError = 'Nội dung Service Account JSON không hợp lệ (thiếu client_email hoặc private_key).';
             return null;
         }
 
@@ -89,11 +97,13 @@ class GoogleDriveClient
 
         $keyResource = openssl_pkey_get_private($privateKey);
         if (!$keyResource) {
+            $this->lastError = 'Không thể đọc khóa RSA private_key từ Service Account JSON.';
             return null;
         }
 
         $success = openssl_sign($signingInput, $signature, $keyResource, OPENSSL_ALGO_SHA256);
         if (!$success) {
+            $this->lastError = 'Lỗi ký số JWT bằng OpenSSL.';
             return null;
         }
 
@@ -108,11 +118,17 @@ class GoogleDriveClient
         ]);
 
         if (is_wp_error($response)) {
+            $this->lastError = 'Lỗi kết nối OAuth2: ' . $response->get_error_message();
             return null;
         }
 
         $body = json_decode(wp_remote_retrieve_body($response), true);
-        return $body['access_token'] ?? null;
+        if (empty($body['access_token'])) {
+            $this->lastError = 'Google OAuth2 (Service Account): ' . ($body['error_description'] ?? ($body['error'] ?? 'Không nhận được access_token'));
+            return null;
+        }
+
+        return $body['access_token'];
     }
 
     /**
@@ -125,6 +141,17 @@ class GoogleDriveClient
         $refreshToken = trim($this->settings['oauth_refresh_token'] ?? '');
 
         if (empty($clientId) || empty($clientSecret) || empty($refreshToken)) {
+            $missing = [];
+            if (empty($clientId)) {
+                $missing[] = 'Client ID';
+            }
+            if (empty($clientSecret)) {
+                $missing[] = 'Client Secret';
+            }
+            if (empty($refreshToken)) {
+                $missing[] = 'Refresh Token (chưa bấm Ủy quyền kết nối Google Drive)';
+            }
+            $this->lastError = 'Thiếu cấu hình OAuth 2.0: ' . implode(', ', $missing);
             return null;
         }
 
@@ -139,11 +166,17 @@ class GoogleDriveClient
         ]);
 
         if (is_wp_error($response)) {
+            $this->lastError = 'Lỗi kết nối OAuth2: ' . $response->get_error_message();
             return null;
         }
 
         $body = json_decode(wp_remote_retrieve_body($response), true);
-        return $body['access_token'] ?? null;
+        if (empty($body['access_token'])) {
+            $this->lastError = 'Google OAuth2: ' . ($body['error_description'] ?? ($body['error'] ?? 'Refresh token đã hết hạn hoặc bị thu hồi'));
+            return null;
+        }
+
+        return $body['access_token'];
     }
 
     /**
@@ -157,7 +190,7 @@ class GoogleDriveClient
         if (!$token) {
             return [
                 'success' => false,
-                'message' => __('Không thể xác thực với Google API. Vui lòng kiểm tra lại cấu hình Service Account hoặc OAuth.', 'spl-cloud-backup'),
+                'message' => __('Không thể xác thực với Google API: ', 'spl-cloud-backup') . ($this->lastError ?: __('Vui lòng kiểm tra lại cấu hình Service Account hoặc OAuth.', 'spl-cloud-backup')),
             ];
         }
 
@@ -190,6 +223,18 @@ class GoogleDriveClient
         $usage = isset($quota['usage']) ? size_format((int) $quota['usage'], 2) : 'N/A';
         $limit = isset($quota['limit']) ? size_format((int) $quota['limit'], 2) : 'Unlimited';
 
+        if (($this->settings['drive_auth_type'] ?? 'service_account') === 'service_account' && isset($quota['limit']) && (int) $quota['limit'] === 0) {
+            return [
+                'success' => false,
+                'message' => sprintf(
+                    __('Kết nối API thành công (%s), NHƯNG tài khoản Service Account này có hạn mức lưu trữ 0 Byte (0 B / 0 B) nên Google chặn tải tệp lên Drive cá nhân. Vui lòng chuyển sang phương thức "OAuth 2.0 (Client ID / Refresh Token)" để sử dụng dung lượng Google Drive của bạn!', 'spl-cloud-backup'),
+                    $user
+                ),
+                'user'    => $user,
+                'quota'   => sprintf('%s / %s', $usage, $limit),
+            ];
+        }
+
         return [
             'success' => true,
             'message' => sprintf(__('Kết nối Google Drive thành công! Tài khoản: %s (Đã dùng: %s / %s)', 'spl-cloud-backup'), $user, $usage, $limit),
@@ -208,9 +253,10 @@ class GoogleDriveClient
             return null;
         }
 
-        // Search for existing active folder
+        // Search for existing active folder (including Shared Drives and shared folders)
         $query = sprintf("name = '%s' and mimeType = 'application/vnd.google-apps.folder' and trashed = false", addslashes($folderName));
-        $searchUrl = 'https://www.googleapis.com/drive/v3/files?q=' . rawurlencode($query) . '&fields=files(id,name)';
+        $searchUrl = 'https://www.googleapis.com/drive/v3/files?q=' . rawurlencode($query)
+                   . '&fields=files(id,name)&supportsAllDrives=true&includeItemsFromAllDrives=true';
 
         $response = wp_remote_get($searchUrl, [
             'timeout' => 15,
@@ -224,10 +270,15 @@ class GoogleDriveClient
             if (!empty($data['files'][0]['id'])) {
                 return $data['files'][0]['id'];
             }
+        } elseif (is_wp_error($response)) {
+            $this->lastError = $response->get_error_message();
+        } else {
+            $errData = json_decode(wp_remote_retrieve_body($response), true);
+            $this->lastError = $errData['error']['message'] ?? ('HTTP ' . wp_remote_retrieve_response_code($response));
         }
 
         // Folder not found, create new folder
-        $createResponse = wp_remote_post('https://www.googleapis.com/drive/v3/files', [
+        $createResponse = wp_remote_post('https://www.googleapis.com/drive/v3/files?supportsAllDrives=true', [
             'timeout' => 20,
             'headers' => [
                 'Authorization' => 'Bearer ' . $token,
@@ -242,6 +293,13 @@ class GoogleDriveClient
         if (!is_wp_error($createResponse) && wp_remote_retrieve_response_code($createResponse) === 200) {
             $data = json_decode(wp_remote_retrieve_body($createResponse), true);
             return $data['id'] ?? null;
+        }
+
+        if (is_wp_error($createResponse)) {
+            $this->lastError = $createResponse->get_error_message();
+        } else {
+            $errData = json_decode(wp_remote_retrieve_body($createResponse), true);
+            $this->lastError = $errData['error']['message'] ?? ('HTTP ' . wp_remote_retrieve_response_code($createResponse));
         }
 
         return null;
@@ -287,7 +345,7 @@ class GoogleDriveClient
             $metadata['parents'] = [$folderId];
         }
 
-        $initUrl = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,webViewLink,webContentLink,size';
+        $initUrl = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true&fields=id,name,webViewLink,webContentLink,size';
         $initResponse = wp_remote_post($initUrl, [
             'timeout' => 30,
             'headers' => [
@@ -437,6 +495,7 @@ class GoogleDriveClient
         $query = sprintf("'%s' in parents and trashed = false", addslashes($folderId));
         $url = 'https://www.googleapis.com/drive/v3/files?q=' . rawurlencode($query)
              . '&orderBy=createdTime desc&pageSize=' . $max
+             . '&supportsAllDrives=true&includeItemsFromAllDrives=true'
              . '&fields=files(id,name,size,createdTime,webViewLink)';
 
         $response = wp_remote_get($url, [
@@ -464,7 +523,7 @@ class GoogleDriveClient
             return false;
         }
 
-        $response = wp_remote_request('https://www.googleapis.com/drive/v3/files/' . rawurlencode($fileId), [
+        $response = wp_remote_request('https://www.googleapis.com/drive/v3/files/' . rawurlencode($fileId) . '?supportsAllDrives=true', [
             'method'  => 'DELETE',
             'timeout' => 15,
             'headers' => [
